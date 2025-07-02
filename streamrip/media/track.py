@@ -7,7 +7,7 @@ from .. import converter
 from ..client import Client, Downloadable
 from ..config import Config
 from ..db import Database
-from ..exceptions import NonStreamableError, NetworkError, APIError, InvalidAPIResponseError # Added InvalidAPIResponseError
+from ..exceptions import NonStreamableError, NetworkError, APIError, InvalidAPIResponseError
 from ..filepath_utils import clean_filename
 from ..metadata import AlbumMetadata, Covers, TrackMetadata, tag_file
 from ..progress import add_title, get_progress_callback, remove_title
@@ -24,7 +24,6 @@ class Track(Media):
     downloadable: Downloadable
     config: Config
     folder: str
-    # Is None if a cover doesn't exist for the track
     cover_path: str | None
     db: Database
     download_path: str = ""
@@ -36,8 +35,6 @@ class Track(Media):
             os.makedirs(self.folder, exist_ok=True)
         except OSError as e:
             logger.error(f"Track.preprocess: Could not create track folder {self.folder} for '{self.meta.title}': {e}", exc_info=True)
-            # Decide if this is a fatal error for this track. If so, raise an exception or handle.
-            # For now, let it proceed, download might fail if folder doesn't exist.
         if self.is_single:
             add_title(self.meta.title)
 
@@ -49,14 +46,21 @@ class Track(Media):
             return
 
         retry = False
+        download_size = 0 # Initialize download_size
+        try:
+            download_size = await self.downloadable.size() # Get size before callback
+        except Exception as e:
+            logger.error(f"Track.download: Could not get downloadable size for '{self.meta.title}': {e}", exc_info=True)
+            # Decide if this is fatal or if we can proceed without a progress bar total
+            # For now, let's try to proceed, progress bar might show indeterminate.
+
         try:
             async with global_download_semaphore(self.config.session.downloads):
                 logger.debug(f"Track.download: Semaphore acquired for '{self.meta.title}'")
-                download_size = await self.downloadable.size() # Get size before callback
                 with get_progress_callback(
                     self.config.session.cli.progress_bars,
-                    download_size, # Use pre-fetched size
-                    f"Track {self.meta.tracknumber} ({self.meta.title_version_display()})",
+                    download_size,
+                    f"Track {self.meta.tracknumber:02d} - {self.meta.title}", # Corrected line
                 ) as callback:
                     logger.debug(f"Track.download: Attempting download for '{self.meta.title}'")
                     await self.downloadable.download(self.download_path, callback)
@@ -75,13 +79,19 @@ class Track(Media):
 
         logger.info(f"Retrying download for track '{self.meta.title}' (ID: {self.meta.info.id})")
         try:
+            # Re-fetch size for retry in case it's dynamic or failed initially
+            try:
+                 retry_download_size = await self.downloadable.size()
+            except Exception as e:
+                 logger.error(f"Track.download: Could not get downloadable size for retry of '{self.meta.title}': {e}", exc_info=True)
+                 retry_download_size = 0 # Fallback
+
             async with global_download_semaphore(self.config.session.downloads):
                 logger.debug(f"Track.download: Semaphore acquired for retry of '{self.meta.title}'")
-                download_size = await self.downloadable.size() # Get size again for retry
                 with get_progress_callback(
                     self.config.session.cli.progress_bars,
-                    download_size,
-                    f"Track {self.meta.tracknumber} ({self.meta.title_version_display()}) (retry)",
+                    retry_download_size, # Use potentially updated size
+                    f"Track {self.meta.tracknumber:02d} - {self.meta.title} (retry)", # Corrected line
                 ) as callback:
                     logger.debug(f"Track.download: Attempting retry download for '{self.meta.title}'")
                     await self.downloadable.download(self.download_path, callback)
@@ -92,11 +102,9 @@ class Track(Media):
                 f"Type: {type(e)}, Repr: {repr(e)}. Skipping.",
                 exc_info=True
             )
-            # Ensure downloadable.source and meta.info.id are valid before using
             source = self.downloadable.source if hasattr(self.downloadable, 'source') else 'unknown_source'
             track_id_to_fail = self.meta.info.id if hasattr(self.meta.info, 'id') else 'unknown_id'
             self.db.set_failed(source, "track", track_id_to_fail)
-
 
     async def postprocess(self):
         if self.is_single:
@@ -104,37 +112,27 @@ class Track(Media):
 
         if not os.path.exists(self.download_path):
             logger.error(f"Track.postprocess: Download path {self.download_path} does not exist for tagging/conversion. Skipping postprocessing for '{self.meta.title}'.")
-            # Potentially mark as failed if file doesn't exist after download claims success
-            # self.db.set_failed(self.meta.info.source, "track", self.meta.info.id) # Be cautious here
             return
 
         try:
             await tag_file(self.download_path, self.meta, self.cover_path)
         except Exception as e:
             logger.error(f"Track.postprocess: Error tagging file {self.download_path} for '{self.meta.title}': {e}", exc_info=True)
-            # Decide if this is a critical error to stop or just log
 
         if self.config.session.conversion.enabled:
             try:
                 await self._convert()
             except Exception as e:
                 logger.error(f"Track.postprocess: Error converting file {self.download_path} for '{self.meta.title}': {e}", exc_info=True)
-                # If conversion fails, the original (downloaded) file still exists unless _convert deletes it prematurely.
-                # The self.download_path might be outdated if conversion failed mid-way.
 
-        # Only mark as downloaded if all critical steps (download) are successful.
-        # Tagging/conversion failures might be logged but not necessarily prevent marking as downloaded.
-        # This depends on desired behavior. For now, assume download success is key.
-        if os.path.exists(self.download_path): # Check if final file (original or converted) exists
+        if os.path.exists(self.download_path):
              self.db.set_downloaded(self.meta.info.id)
         else:
             logger.warning(f"Track.postprocess: Final file for '{self.meta.title}' (ID: {self.meta.info.id}) not found at {self.download_path} after postprocessing. Not marking as downloaded.")
 
-
     async def _convert(self):
         c = self.config.session.conversion
         engine_class = converter.get(c.codec)
-        # Ensure self.download_path exists before attempting conversion
         if not os.path.exists(self.download_path):
             logger.error(f"Track._convert: Source file {self.download_path} for conversion does not exist. Skipping conversion for '{self.meta.title}'.")
             return
@@ -146,7 +144,7 @@ class Track(Media):
             remove_source=True,
         )
         logger.debug(f"Track._convert: Converting '{self.meta.title}' to {c.codec.upper()}")
-        await engine.convert()
+        await engine.convert() # This is where NotImplementedError was occurring
         logger.info(f"Track._convert: Conversion successful for '{self.meta.title}'. New path: {engine.final_fn}")
         self.download_path = engine.final_fn
 
@@ -154,12 +152,14 @@ class Track(Media):
         c = self.config.session.filepaths
         formatter = c.track_format
 
+        track_filename_part = ""
         try:
             track_filename_part = self.meta.format_track_path(formatter)
         except Exception as e:
-            logger.error(f"Error formatting track path for track ID {self.meta.info.id}: {e}. Using default.", exc_info=True)
-            track_filename_part = f"{self.meta.tracknumber_display()} - {self.meta.title_display()}"
-
+            logger.error(f"Error formatting track path for track ID {self.meta.info.id if hasattr(self.meta, 'info') and self.meta.info else 'unknown'}: {e}. Using default.", exc_info=True)
+            track_title_display = self.meta.title if hasattr(self.meta, 'title') else 'unknown_title'
+            track_number_display = f"{self.meta.tracknumber:02d}" if hasattr(self.meta, 'tracknumber') else "00"
+            track_filename_part = f"{track_number_display} - {track_title_display}"
 
         track_path = clean_filename(
             track_filename_part,
@@ -168,20 +168,18 @@ class Track(Media):
         if c.truncate_to > 0 and len(track_path) > c.truncate_to:
             track_path = track_path[: c.truncate_to]
 
-        # Ensure downloadable and its extension are valid before forming path
         extension = "unknown"
         if self.downloadable and hasattr(self.downloadable, 'extension') and self.downloadable.extension:
             extension = self.downloadable.extension
         else:
-            logger.warning(f"Track._set_download_path: Downloadable or its extension is invalid for track '{self.meta.title}'. Using '.unknown' extension.")
-
+            title_for_log = self.meta.title if hasattr(self.meta, 'title') else 'unknown_track'
+            logger.warning(f"Track._set_download_path: Downloadable or its extension is invalid for track '{title_for_log}'. Using '.unknown' extension.")
 
         self.download_path = os.path.join(
             self.folder,
             f"{track_path}.{extension}",
         )
-        logger.debug(f"Track._set_download_path: Set download path for '{self.meta.title}' to {self.download_path}")
-
+        logger.debug(f"Track._set_download_path: Set download path for '{self.meta.title if hasattr(self.meta, 'title') else 'unknown_track'}' to {self.download_path}")
 
 @dataclass(slots=True)
 class PendingTrack(Pending):
@@ -242,45 +240,45 @@ class PendingTrack(Pending):
 
         quality = self.config.session.get_source(source).quality
         downloadable = None
-        logger.debug(f"PendingTrack.resolve: Attempting to get downloadable for track ID {self.id}, title '{meta.title}', quality {quality}")
+        track_title_for_log = meta.title if hasattr(meta, 'title') else self.id
+        logger.debug(f"PendingTrack.resolve: Attempting to get downloadable for track ID {self.id}, title '{track_title_for_log}', quality {quality}")
         try:
             downloadable = await self.client.get_downloadable(self.id, quality)
             logger.debug(f"PendingTrack.resolve: Got downloadable for track ID {self.id}. Type: {type(downloadable)}, Is None: {downloadable is None}")
         except NonStreamableError as e:
             logger.warning(
-                f"PendingTrack.resolve: Track {meta.title} ({self.id}) on {source} not streamable (downloadable): {e.get_display_message() if hasattr(e, 'get_display_message') else e}. Returning None."
+                f"PendingTrack.resolve: Track {track_title_for_log} ({self.id}) on {source} not streamable (downloadable): {e.get_display_message() if hasattr(e, 'get_display_message') else e}. Returning None."
             )
             self.db.set_failed(source, "track", self.id)
             return None
         except (NetworkError, APIError) as e:
-            logger.error(f"PendingTrack.resolve: API/Network error fetching downloadable for track {meta.title} ({self.id}) on {source}: {e.get_display_message() if hasattr(e, 'get_display_message') else e}. Returning None.")
+            logger.error(f"PendingTrack.resolve: API/Network error fetching downloadable for track {track_title_for_log} ({self.id}) on {source}: {e.get_display_message() if hasattr(e, 'get_display_message') else e}. Returning None.")
             self.db.set_failed(source, "track", self.id)
             return None
         except Exception as e:
-            logger.error(f"PendingTrack.resolve: Unexpected error fetching downloadable for track {meta.title} ({self.id}) on {source}: {e}. Returning None.", exc_info=True)
+            logger.error(f"PendingTrack.resolve: Unexpected error fetching downloadable for track {track_title_for_log} ({self.id}) on {source}: {e}. Returning None.", exc_info=True)
             self.db.set_failed(source, "track", self.id)
             return None
 
         if downloadable is None:
-            logger.error(f"PendingTrack.resolve: No downloadable returned for track {meta.title} ({self.id}) on {source} (downloadable is None). Returning None.")
+            logger.error(f"PendingTrack.resolve: No downloadable returned for track {track_title_for_log} ({self.id}) on {source} (downloadable is None). Returning None.")
             self.db.set_failed(source, "track", self.id)
             return None
 
         downloads_config = self.config.session.downloads
         current_folder = self.folder
-        if downloads_config.disc_subdirectories and hasattr(self.album, 'disctotal') and self.album.disctotal > 1 and hasattr(meta, 'discnumber'):
+        if downloads_config.disc_subdirectories and hasattr(self.album, 'disctotal') and self.album.disctotal > 1 and hasattr(meta, 'discnumber') and meta.discnumber is not None:
             current_folder = os.path.join(self.folder, f"Disc {meta.discnumber}")
 
-        logger.debug(f"PendingTrack.resolve: Successfully resolved track ID {self.id}. Title: '{meta.title}'. Downloadable URL (first 50 chars): {downloadable.url[:50] if hasattr(downloadable, 'url') else 'N/A'}")
+        logger.debug(f"PendingTrack.resolve: Successfully resolved track ID {self.id}. Title: '{track_title_for_log}'. Downloadable URL (first 50 chars): {downloadable.url[:50] if hasattr(downloadable, 'url') else 'N/A'}")
         return Track(
-            meta=meta, # Use the fully built TrackMetadata
+            meta=meta,
             downloadable=downloadable,
             config=self.config,
-            folder=current_folder, # Use potentially modified folder for disc subdirs
+            folder=current_folder,
             cover_path=self.cover_path,
             db=self.db,
         )
-
 
 @dataclass(slots=True)
 class PendingSingle(Pending):
@@ -357,15 +355,14 @@ class PendingSingle(Pending):
         parent_folder = session_config.downloads.folder
         current_folder = parent_folder
         if session_config.filepaths.add_singles_to_folder:
-            current_folder = self._format_folder(album_meta, parent_folder) # Pass parent_folder explicitly
+            current_folder = self._format_folder(album_meta, parent_folder)
 
         try:
             os.makedirs(current_folder, exist_ok=True)
         except OSError as e:
             logger.error(f"PendingSingle.resolve: Could not create folder {current_folder} for track {self.id}: {e}. Returning None.", exc_info=True)
-            self.db.set_failed(source, "track", self.id) # Mark as failed if folder creation fails
+            self.db.set_failed(source, "track", self.id)
             return None
-
 
         embedded_cover_path = None
         downloadable_obj = None
@@ -383,7 +380,6 @@ class PendingSingle(Pending):
                 embedded_cover_path = results[0]
 
             if isinstance(results[1], Exception):
-                # Log specific error type if it's one of ours, else generic
                 err_msg = results[1].get_display_message() if hasattr(results[1], 'get_display_message') else str(results[1])
                 logger.error(f"PendingSingle.resolve: Error fetching downloadable for track {self.id}: {err_msg}", exc_info=isinstance(results[1], Exception))
                 self.db.set_failed(source, "track", self.id)
@@ -391,7 +387,6 @@ class PendingSingle(Pending):
             else:
                 downloadable_obj = results[1]
                 logger.debug(f"PendingSingle.resolve: Got downloadable for track ID {self.id}. Type: {type(downloadable_obj)}")
-
 
         except Exception as e:
             logger.error(f"PendingSingle.resolve: Unexpected error during gather for track {self.id} (cover/downloadable): {e}. Returning None.", exc_info=True)
@@ -414,9 +409,9 @@ class PendingSingle(Pending):
             is_single=True,
         )
 
-    def _format_folder(self, meta: AlbumMetadata, parent_folder_base: str) -> str: # Added parent_folder_base
+    def _format_folder(self, meta: AlbumMetadata, parent_folder_base: str) -> str:
         c = self.config.session
-        current_parent = parent_folder_base # Start with the base downloads folder
+        current_parent = parent_folder_base
 
         if c.downloads.source_subdirectories:
             current_parent = os.path.join(current_parent, self.client.source.capitalize())
@@ -425,35 +420,32 @@ class PendingSingle(Pending):
             album_specific_part = meta.format_folder_path(c.filepaths.folder_format)
         except Exception as e:
             logger.error(f"Error formatting album-specific folder part for album ID {meta.id if hasattr(meta, 'id') else 'unknown'}: {e}. Using default.", exc_info=True)
-            album_specific_part = f"{meta.album_artist_display()} - {meta.album_display()}"
-
+            album_artist_display = meta.album_artist_display() if hasattr(meta, 'album_artist_display') else 'Unknown Artist'
+            album_display = meta.album_display() if hasattr(meta, 'album_display') else 'Unknown Album'
+            album_specific_part = f"{album_artist_display} - {album_display}"
 
         return os.path.join(current_parent, clean_filepath(album_specific_part, c.filepaths.restrict_characters))
 
     async def _download_cover(self, covers: Covers, folder: str) -> str | None:
-        # Ensure client session is available for download_artwork
         if not self.client.session:
             logger.error("PendingSingle._download_cover: Client session not available for downloading cover.")
-            # Attempt to initialize session if not available (e.g. if login wasn't called)
-            # This is a fallback, ideally session is always ready.
             try:
-                await self.client.login() # This might be problematic if called out of sequence
-                if not self.client.session: # Still no session after login attempt
+                await self.client.login()
+                if not self.client.session:
                      raise ClientError("Client session could not be initialized for cover download.")
             except Exception as e:
                 logger.error(f"Failed to initialize client session for cover download: {e}")
                 return None
 
-
         logger.debug(f"PendingSingle._download_cover: Attempting to download cover into {folder}")
         embed_path, _ = await download_artwork(
-            self.client.session, # Pass the client's aiohttp.ClientSession
+            self.client.session,
             folder,
             covers,
             self.config.session.artwork,
-            for_playlist=False, # Assuming singles are not playlist context for artwork
+            for_playlist=False,
         )
         logger.debug(f"PendingSingle._download_cover: Artwork download result path: {embed_path}")
         return embed_path
 
-from ..exceptions import ClientError, APIError, NetworkError # Ensure these are available if not imported at top
+from ..exceptions import ClientError # Ensure this is available if not imported at top

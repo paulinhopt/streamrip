@@ -677,13 +677,32 @@ class TidalClient(Client):
                 async with self.rate_limiter:
                     async with self.session.get(url, params=current_params) as http_resp:
                         try:
-                            resp_data = await http_resp.json()
-                        except JSONDecodeError:
+                            # Attempt to parse JSON. content_type=None allows various JSON-compatible types.
+                            resp_data = await http_resp.json(content_type=None)
+                        except (JSONDecodeError, aiohttp.client_exceptions.ContentTypeError) as json_err:
+                            # If JSON decoding fails (e.g. HTML error page for 404, or unexpected mimetype)
                             resp_text = await http_resp.text()
-                            resp_data = {"message": resp_text[:200]} # Fallback for non-JSON
+                            if http_resp.status == 404:
+                                # If it's a 404 and not JSON, it's clearly a ResourceNotFoundError
+                                raise ResourceNotFoundError(
+                                    f"Recurso não encontrado (404) em {path} e a resposta não era JSON: {resp_text[:150]}",
+                                    item=item_id_for_logging
+                                ) from json_err
+                            # For other statuses, treat as InvalidAPIResponse if it should have been JSON
                             logger.warning(
-                                f"Resposta não-JSON da API Tidal para {path} (status {http_resp.status}): {resp_text[:100]}"
+                                f"Falha ao decodificar JSON da API Tidal para {path} (status {http_resp.status}): {json_err}. Texto: {resp_text[:100]}"
                             )
+                            # Create a minimal dict to allow further status code processing to potentially extract a message
+                            resp_data = {"message": f"Falha na decodificação JSON: {resp_text[:100]}", "_json_decode_failed": True}
+                            # If not a 404, but JSON decoding failed, it might be an InvalidAPIResponse later if not handled by status
+                            # No, let's be stricter: if it's not a 404 and fails JSON decode, it's an InvalidAPIResponseError
+                            if http_resp.status != 404 : # Re-check status, because we only want to raise RNF for 404 here
+                                 raise InvalidAPIResponseError(
+                                     f"Resposta da API Tidal para {path} (status {http_resp.status}) não é JSON válido: {json_err}",
+                                     item=item_id_for_logging
+                                 ) from json_err
+                            # If it was a 404, but somehow didn't raise RNF above (e.g. if text() also failed, though unlikely)
+                            # this resp_data will be used by the 404 handler below.
 
                         if http_resp.status == 401: # Unauthorized, token likely expired
                             logger.warning(f"Token de acesso Tidal não autorizado (401) para {path}. Tentando atualizar...")

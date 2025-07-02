@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import shutil
+import subprocess # Added
 from tempfile import gettempdir
 from typing import Final, Optional
 
@@ -82,22 +83,70 @@ class Converter:
             self.final_fn = custom_fn
 
         self.command = self._gen_command()
-        logger.debug("Generated conversion command: %s", self.command)
+        logger.debug(f"Generated conversion command: {' '.join(self.command)}")
 
-        process = await asyncio.create_subprocess_exec(
-            *self.command,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        out, err = await process.communicate()
-        if process.returncode == 0 and os.path.isfile(self.tempfile):
-            if self.remove_source:
-                os.remove(self.filename)
-                logger.debug("Source removed: %s", self.filename)
+        try:
+            # Execute ffmpeg in a separate thread to avoid blocking asyncio loop
+            completed_process = await asyncio.to_thread(
+                subprocess.run,
+                self.command,
+                capture_output=True, # Capture stdout and stderr
+                check=False # We will check returncode manually
+            )
 
-            shutil.move(self.tempfile, self.final_fn)
-            logger.debug("Moved: %s -> %s", self.tempfile, self.final_fn)
-        else:
-            raise ConversionError(f"FFmpeg output:\n{out, err}")
+            if completed_process.returncode == 0:
+                if os.path.isfile(self.tempfile): # Check if temp output file was created
+                    if self.remove_source:
+                        try:
+                            os.remove(self.filename)
+                            logger.debug(f"Source file removed: {self.filename}")
+                        except OSError as e:
+                            logger.warning(f"Could not remove source file {self.filename}: {e}")
+
+                    try:
+                        shutil.move(self.tempfile, self.final_fn)
+                        logger.debug(f"Moved converted file: {self.tempfile} -> {self.final_fn}")
+                    except OSError as e:
+                        logger.error(f"Could not move temp file {self.tempfile} to {self.final_fn}: {e}")
+                        # Attempt to remove temp file if move fails to prevent clutter
+                        if os.path.exists(self.tempfile):
+                            try:
+                                os.remove(self.tempfile)
+                            except OSError:
+                                logger.warning(f"Could not remove temp file {self.tempfile} after failed move.")
+                        raise ConversionError(f"Failed to move converted file: {e}") from e
+                else:
+                    # This case (returncode 0 but no tempfile) should be rare with ffmpeg if -y is used
+                    # but good to handle.
+                    stderr_output = completed_process.stderr.decode('utf-8', errors='replace').strip()
+                    logger.error(f"FFmpeg reported success (returncode 0) but output temp file {self.tempfile} not found. Stderr: {stderr_output}")
+                    raise ConversionError(f"FFmpeg success but output file missing. Stderr: {stderr_output}")
+            else:
+                # Conversion failed
+                stderr_output = completed_process.stderr.decode('utf-8', errors='replace').strip()
+                stdout_output = completed_process.stdout.decode('utf-8', errors='replace').strip()
+                logger.error(
+                    f"FFmpeg conversion failed with return code {completed_process.returncode}.\n"
+                    f"Command: {' '.join(self.command)}\n"
+                    f"Stderr: {stderr_output}\n"
+                    f"Stdout: {stdout_output}"
+                )
+                # Attempt to remove temp file if it exists after a failure
+                if os.path.exists(self.tempfile):
+                    try:
+                        os.remove(self.tempfile)
+                    except OSError:
+                        logger.warning(f"Could not remove temp file {self.tempfile} after failed conversion.")
+                raise ConversionError(
+                    f"FFmpeg conversion failed (code {completed_process.returncode}). Stderr: {stderr_output}"
+                )
+        except FileNotFoundError: # e.g. ffmpeg not found by subprocess.run
+            logger.critical("ffmpeg executable not found. Please ensure it is installed and in your PATH.")
+            raise ConversionError("ffmpeg not found. Conversion cannot proceed.")
+        except Exception as e: # Catch any other unexpected error during subprocess execution
+            logger.error(f"Unexpected error during conversion process: {e}", exc_info=True)
+            raise ConversionError(f"Unexpected error during conversion: {e}") from e
+
 
     def _gen_command(self):
         command = [

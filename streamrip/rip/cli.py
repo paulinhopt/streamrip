@@ -90,6 +90,9 @@ def rip(
     ctx, config_path, folder, no_db, quality, codec, no_progress, no_ssl_verify, verbose
 ):
     """Streamrip: the all in one music downloader."""
+    # Print version at the very beginning
+    console.print(f"Streamrip version: [bold cyan]{__version__}[/bold cyan]")
+
     global logger
     logging.basicConfig(
         level="INFO",

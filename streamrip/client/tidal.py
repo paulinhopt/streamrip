@@ -228,15 +228,18 @@ class TidalClient(Client):
             except ResourceNotFoundError:
                 logger.debug(f"Nenhuma letra encontrada para a faixa {item_id}")
                 item_data["lyrics"] = ""
-            except (TidalAPIError, InvalidAPIResponseError) as e: # Catch API or response errors for lyrics
-                logger.warning(f"Falha ao obter letras para a faixa {item_id}: {e}")
+            except (TidalAPIError, InvalidAPIResponseError) as e:
+                logger.warning(f"Falha de API/Resposta ao obter letras para a faixa {item_id}: {e.get_display_message() if hasattr(e, 'get_display_message') else e}")
                 item_data["lyrics"] = ""
-            except Exception as e: # Catch any other unexpected error
+            except TypeError as te: # Captura específica para TypeError
+                logger.error(f"TypeError ao processar letras para faixa {item_id}: {te}", exc_info=True)
+                item_data["lyrics"] = ""
+            except Exception as e:
                 logger.error(f"Erro inesperado ao buscar letras para a faixa {item_id}: {e}", exc_info=True)
                 item_data["lyrics"] = ""
 
 
-        logger.debug(f"Metadados para {media_type} {item_id}: {item_data}")
+        logger.debug(f"Metadados para {media_type} {item_id}: {item_data if isinstance(item_data, dict) else type(item_data)}")
         return item_data
 
     async def search(self, media_type: str, query: str, limit: int = 100) -> list[dict]:

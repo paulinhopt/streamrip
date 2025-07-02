@@ -129,30 +129,64 @@ class PendingTrack(Pending):
             return None
 
         source = self.client.source
+        resp = None # Initialize resp
         try:
             resp = await self.client.get_metadata(self.id, "track")
         except NonStreamableError as e:
-            logger.error(f"Track {self.id} not available for stream on {source}: {e}")
+            logger.warning(f"Track {self.id} on {source} not streamable (metadata): {e.get_display_message() if hasattr(e, 'get_display_message') else e}")
+            self.db.set_failed(source, "track", self.id)
+            return None
+        except (NetworkError, APIError) as e:
+            logger.error(f"API/Network error fetching metadata for track {self.id} on {source}: {e.get_display_message() if hasattr(e, 'get_display_message') else e}")
+            self.db.set_failed(source, "track", self.id)
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error fetching metadata for track {self.id} on {source}: {e}", exc_info=True)
+            self.db.set_failed(source, "track", self.id)
             return None
 
+        if resp is None:
+            logger.error(f"No metadata returned for track {self.id} on {source}, but no exception was raised.")
+            self.db.set_failed(source, "track", self.id)
+            return None
+
+        meta = None # Initialize meta
         try:
             meta = TrackMetadata.from_resp(self.album, source, resp)
         except Exception as e:
-            logger.error(f"Error building track metadata for {self.id}: {e}")
+            logger.error(f"Error building track metadata for {self.id} from response (type: {type(resp)}): {e}", exc_info=True)
+            self.db.set_failed(source, "track", self.id)
             return None
 
+        # This check might be redundant if TrackMetadata.from_resp raises an exception on failure or returns None reliably.
+        # If it can return None without an exception, this check is valid.
         if meta is None:
-            logger.error(f"Track {self.id} not available for stream on {source}")
+            logger.error(f"Failed to build TrackMetadata for {self.id} on {source} (meta is None).")
             self.db.set_failed(source, "track", self.id)
             return None
 
         quality = self.config.session.get_source(source).quality
+        downloadable = None # Initialize downloadable
         try:
             downloadable = await self.client.get_downloadable(self.id, quality)
         except NonStreamableError as e:
-            logger.error(
-                f"Error getting downloadable data for track {meta.tracknumber} [{self.id}]: {e}"
+            logger.warning(
+                f"Track {meta.title} ({self.id}) on {source} not streamable (downloadable): {e.get_display_message() if hasattr(e, 'get_display_message') else e}"
             )
+            self.db.set_failed(source, "track", self.id)
+            return None
+        except (NetworkError, APIError) as e:
+            logger.error(f"API/Network error fetching downloadable for track {meta.title} ({self.id}) on {source}: {e.get_display_message() if hasattr(e, 'get_display_message') else e}")
+            self.db.set_failed(source, "track", self.id)
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error fetching downloadable for track {meta.title} ({self.id}) on {source}: {e}", exc_info=True)
+            self.db.set_failed(source, "track", self.id)
+            return None
+
+        if downloadable is None:
+            logger.error(f"No downloadable returned for track {meta.title} ({self.id}) on {source}, but no exception was raised.")
+            self.db.set_failed(source, "track", self.id)
             return None
 
         downloads_config = self.config.session.downloads
@@ -194,38 +228,59 @@ class PendingSingle(Pending):
         try:
             resp = await self.client.get_metadata(self.id, "track")
         except NonStreamableError as e:
-            logger.error(f"Error fetching track {self.id}: {e}")
+            logger.warning(f"Single track {self.id} on {self.client.source} not streamable (metadata): {e.get_display_message() if hasattr(e, 'get_display_message') else e}")
+            self.db.set_failed(self.client.source, "track", self.id)
             return None
-        # Patch for soundcloud
+        except (NetworkError, APIError) as e:
+            logger.error(f"API/Network error fetching metadata for single track {self.id} on {self.client.source}: {e.get_display_message() if hasattr(e, 'get_display_message') else e}")
+            self.db.set_failed(self.client.source, "track", self.id)
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error fetching metadata for single track {self.id} on {self.client.source}: {e}", exc_info=True)
+            self.db.set_failed(self.client.source, "track", self.id)
+            return None
+
+        if resp is None:
+            logger.error(f"No metadata returned for single track {self.id} on {self.client.source}")
+            self.db.set_failed(self.client.source, "track", self.id)
+            return None
+
+        album = None
         try:
+            # This from_track_resp is crucial; it might be where album data is derived for singles
             album = AlbumMetadata.from_track_resp(resp, self.client.source)
         except Exception as e:
-            logger.error(f"Error building album metadata for track {id=}: {e}")
-            return None
-
-        if album is None:
+            logger.error(f"Error building album metadata for single track {self.id}: {e}", exc_info=True)
+            # Continue without full album data if this fails? Or fail the track?
+            # For now, let's allow it to proceed if meta can still be built, but log error.
+            # If album is essential for TrackMetadata, this might need to return None.
+            # However, TrackMetadata.from_resp takes album as an arg, so it might be an issue.
+            # For safety, if album cannot be derived, we should probably fail.
             self.db.set_failed(self.client.source, "track", self.id)
-            logger.error(
-                f"Cannot stream track (am) ({self.id}) on {self.client.source}",
-            )
             return None
 
+
+        if album is None: # Should be caught by the exception above if from_track_resp fails critically
+            logger.error(f"Could not derive album metadata for single track {self.id} on {self.client.source}.")
+            self.db.set_failed(self.client.source, "track", self.id)
+            return None
+
+        meta = None
         try:
             meta = TrackMetadata.from_resp(album, self.client.source, resp)
         except Exception as e:
-            logger.error(f"Error building track metadata for track {id=}: {e}")
+            logger.error(f"Error building track metadata for single track {self.id}: {e}", exc_info=True)
+            self.db.set_failed(self.client.source, "track", self.id)
             return None
 
-        if meta is None:
+        if meta is None: # If from_resp returns None without exception
+            logger.error(f"Failed to build track metadata for single track {self.id} on {self.client.source}.")
             self.db.set_failed(self.client.source, "track", self.id)
-            logger.error(
-                f"Cannot stream track (tm) ({self.id}) on {self.client.source}",
-            )
             return None
 
         config = self.config.session
         quality = getattr(config, self.client.source).quality
-        assert isinstance(quality, int)
+        # assert isinstance(quality, int) # quality is already validated by config loading or Pydantic
         parent = config.downloads.folder
         if config.filepaths.add_singles_to_folder:
             folder = os.path.join(parent, self._format_folder(album))
@@ -234,10 +289,41 @@ class PendingSingle(Pending):
 
         os.makedirs(folder, exist_ok=True)
 
-        embedded_cover_path, downloadable = await asyncio.gather(
-            self._download_cover(album.covers, folder),
-            self.client.get_downloadable(self.id, quality),
-        )
+        embedded_cover_path = None
+        downloadable = None
+        try:
+            # Gather cover download and track downloadable info concurrently
+            results = await asyncio.gather(
+                self._download_cover(album.covers, folder),
+                self.client.get_downloadable(self.id, quality),
+                return_exceptions=True # Handle individual failures
+            )
+
+            # Process cover result
+            if isinstance(results[0], Exception):
+                logger.error(f"Error downloading cover for single track {self.id}: {results[0]}", exc_info=isinstance(results[0], Exception))
+                # Continue without cover if it fails
+            else:
+                embedded_cover_path = results[0]
+
+            # Process downloadable result
+            if isinstance(results[1], Exception):
+                logger.error(f"Error fetching downloadable for single track {self.id}: {results[1]}", exc_info=isinstance(results[1], Exception))
+                self.db.set_failed(self.client.source, "track", self.id)
+                return None # Cannot proceed without downloadable
+            else:
+                downloadable = results[1]
+
+        except Exception as e: # Catch errors from asyncio.gather itself or unexpected issues
+            logger.error(f"Unexpected error during gather for single track {self.id} (cover/downloadable): {e}", exc_info=True)
+            self.db.set_failed(self.client.source, "track", self.id)
+            return None
+
+        if downloadable is None: # Should be caught by gather's exception handling, but as a safeguard
+            logger.error(f"Downloadable is None for single track {self.id} after gather, failing.")
+            self.db.set_failed(self.client.source, "track", self.id)
+            return None
+
         return Track(
             meta,
             downloadable,

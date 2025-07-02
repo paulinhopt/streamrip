@@ -119,7 +119,7 @@ class SoundcloudClient(Client):
         self,
         media_type: str,
         query: str,
-        limit: int = 50, # SoundCloud API default is often lower, e.g., 10 or 20 for search
+        limit: int = 50,
         offset: int = 0,
     ) -> list[dict]:
         if media_type not in ("track", "playlist"):
@@ -134,7 +134,6 @@ class SoundcloudClient(Client):
             "linked_partitioning": "1",
         }
 
-        # Path is search/tracks or search/playlists
         resp_data, _ = await self._api_request(f"search/{media_type}s", params=params)
 
         if not isinstance(resp_data, dict) or "collection" not in resp_data:
@@ -204,7 +203,6 @@ class SoundcloudClient(Client):
         if not download_info.startswith("http"):
              raise InvalidAPIResponseError(f"Informação de download inválida para SoundCloud: '{download_info}'. Esperada URL.", item=item_id)
 
-        # download_info is a URL to a stream manifest (JSON containing the actual stream URL)
         resp_data, _ = await self._request(download_info)
 
         if not isinstance(resp_data, dict) or "url" not in resp_data:
@@ -234,15 +232,15 @@ class SoundcloudClient(Client):
         return resp_data
 
     async def _get_track(self, item_id: str) -> dict:
-        if not item_id.isdigit(): # Basic validation
+        if not item_id.isdigit():
             raise SoundcloudAPIError(f"ID de faixa SoundCloud inválido fornecido para _get_track: {item_id}", item=item_id)
         resp_data, _ = await self._api_request(f"tracks/{item_id}")
-        if not isinstance(resp_data, dict): # Check if response is a dictionary
+        if not isinstance(resp_data, dict):
             raise InvalidAPIResponseError(f"Resposta de faixa SoundCloud inválida para ID {item_id}.", item=item_id)
         return resp_data
 
     async def _get_playlist(self, playlist_id: str) -> dict:
-        if not playlist_id.isdigit(): # Basic validation
+        if not playlist_id.isdigit():
             raise SoundcloudAPIError(f"ID de playlist SoundCloud inválido fornecido para _get_playlist: {playlist_id}", item=playlist_id)
 
         playlist_data, _ = await self._api_request(f"playlists/{playlist_id}")
@@ -252,12 +250,11 @@ class SoundcloudClient(Client):
 
         unresolved_track_ids = [
             track.get("id") for track in playlist_data.get("tracks", [])
-            if isinstance(track, dict) and ( # Ensure track is a dict and has an id
+            if isinstance(track, dict) and (
                 "media" not in track or
-                not isinstance(track.get("media"), dict) or # media should be a dict
-                "transcodings" not in track.get("media", {}) or # transcodings should be in media
-                not isinstance(track.get("media", {}).get("transcodings"), list) or # transcodings should be a list
-                # Check if any valid HLS MP3 transcoding exists
+                not isinstance(track.get("media"), dict) or
+                "transcodings" not in track.get("media", {}) or
+                not isinstance(track.get("media", {}).get("transcodings"), list) or
                 not any(
                     isinstance(tc, dict) and isinstance(tc.get("format"), dict) and
                     tc.get("format", {}).get("protocol") == "hls" and
@@ -265,11 +262,9 @@ class SoundcloudClient(Client):
                     isinstance(tc.get("url"), str) and tc.get("url", "").startswith("http")
                     for tc in track.get("media", {}).get("transcodings", [])
                 )
-            ) and track.get("streamable") and track.get("id") is not None # Only if streamable and has ID
+            ) and track.get("streamable") and track.get("id") is not None
         ]
-        # Filter out None or non-digit IDs from the list
         unresolved_track_ids = [str(tid) for tid in unresolved_track_ids if tid is not None and str(tid).isdigit()]
-
 
         if not unresolved_track_ids:
             logger.debug(f"Todas as faixas na playlist SoundCloud {playlist_id} já estão resolvidas ou não são streamable/válidas.")
@@ -289,7 +284,7 @@ class SoundcloudClient(Client):
 
         track_requests_coroutines = []
         for batch in batches:
-            current_batch_ids = [tid for tid in batch if tid is not None] # Already strings
+            current_batch_ids = [tid for tid in batch if tid is not None]
             if not current_batch_ids:
                 continue
             track_requests_coroutines.append(
@@ -307,7 +302,7 @@ class SoundcloudClient(Client):
             if isinstance(batch_data, list):
                 for track_detail in batch_data:
                     if isinstance(track_detail, dict) and "id" in track_detail:
-                        resolved_tracks_map[track_detail["id"]] = track_detail # Store by original int/str ID
+                        resolved_tracks_map[track_detail["id"]] = track_detail
             else:
                 logger.warning(f"Resposta de lote de faixas inesperada para playlist {playlist_id}: {batch_data}")
 
@@ -317,12 +312,11 @@ class SoundcloudClient(Client):
                 logger.warning(f"Item de faixa inválido na playlist {playlist_id}: {track_stub}")
                 continue
 
-            original_track_id = track_stub["id"] # This ID is an int from SC API
-            # Use original_track_id (int) for map lookup, as that's how they were stored
+            original_track_id = track_stub["id"]
             full_track_data = resolved_tracks_map.get(original_track_id, track_stub)
 
             try:
-                full_track_data["id"] = self._get_custom_id(full_track_data) # This will now be "int_id|url_or_flag"
+                full_track_data["id"] = self._get_custom_id(full_track_data)
             except (SoundcloudAPIError, InvalidAPIResponseError, AssertionError, KeyError) as e:
                 logger.warning(f"Falha ao gerar ID customizado para faixa {original_track_id} na playlist {playlist_id}: {e}")
                 full_track_data["id"] = f"{original_track_id}|{self.NON_STREAMABLE}"
@@ -334,7 +328,6 @@ class SoundcloudClient(Client):
     @classmethod
     def _get_custom_id(cls, track_data: dict) -> str:
         if not isinstance(track_data, dict):
-            # Added item_id for context if available in track_data, though track_data itself is the problem here.
             item_id_for_log = track_data.get("id", "ID desconhecido") if isinstance(track_data, dict) else "Dados inválidos"
             raise InvalidAPIResponseError(f"Dados da faixa inválidos para _get_custom_id: esperado dict, obteve {type(track_data)}", item=item_id_for_log)
 
@@ -354,12 +347,12 @@ class SoundcloudClient(Client):
             return f"{item_id}|{cls.ORIGINAL_DOWNLOAD}"
 
         hls_mp3_stream_url = None
-        for tc in media_info.get("transcodings", []): # Safe default for transcodings
+        for tc in media_info.get("transcodings", []):
             if not isinstance(tc, dict): continue
             fmt = tc.get("format", {})
             if isinstance(fmt, dict) and fmt.get("protocol") == "hls" and fmt.get("mime_type") == "audio/mpeg":
                 url_candidate = tc.get("url")
-                if isinstance(url_candidate, str) and url_candidate.startswith("http"): # Basic URL validation
+                if isinstance(url_candidate, str) and url_candidate.startswith("http"):
                     hls_mp3_stream_url = url_candidate
                     break
 
@@ -380,7 +373,6 @@ class SoundcloudClient(Client):
                 refreshed_client_id, refreshed_app_version = await self._refresh_tokens()
                 self.config.client_id = refreshed_client_id
                 self.config.app_version = refreshed_app_version
-                # Persist refreshed tokens
                 cs_glob = self.global_config.session.soundcloud
                 cf_glob = self.global_config.file.soundcloud
                 cs_glob.client_id, cf_glob.client_id = refreshed_client_id, refreshed_client_id
@@ -425,7 +417,6 @@ class SoundcloudClient(Client):
                                      self.config.app_version = new_app_version
                                      request_params["client_id"] = new_client_id
                                      request_params["app_version"] = new_app_version
-                                     # Persist
                                      cs_glob = self.global_config.session.soundcloud
                                      cf_glob = self.global_config.file.soundcloud
                                      cs_glob.client_id, cf_glob.client_id = new_client_id, new_client_id
@@ -604,4 +595,10 @@ class SoundcloudClient(Client):
 
         logger.info(f"Tokens SoundCloud atualizados: client_id={client_id}, app_version={app_version}")
         return client_id, app_version
->>>>>>> REPLACE
+
+def batched(iterable, n, fillvalue=None):
+    args = [iter(iterable)] * n
+    return list(itertools.zip_longest(*args, fillvalue=fillvalue))
+
+def filter_none(iterable):
+    return (x for x in iterable if x is not None)

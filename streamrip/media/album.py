@@ -34,19 +34,34 @@ class Album(Media):
         async def _resolve_and_download(pending: Pending):
             try:
                 track = await pending.resolve()
-                if track is None:
+                if track is None: # PendingTrack.resolve() returned None due to an error it already logged
                     return
-                await track.rip()
-            except Exception as e:
-                logger.error(f"Error downloading track: {e}")
+                await track.rip() # track is an instance of Track
+            except Exception as e: # Catch any unexpected error during track.rip() itself
+                # This log should ideally not be common if Track.rip() handles its own errors.
+                # However, it's a fallback.
+                logger.error(f"Error downloading track (during rip call in album): {e}", exc_info=True)
 
         results = await asyncio.gather(
             *[_resolve_and_download(p) for p in self.tracks], return_exceptions=True
         )
 
-        for result in results:
-            if isinstance(result, Exception):
-                logger.error(f"Album track processing error: {result}")
+        # This loop is for exceptions raised by _resolve_and_download coroutine directly
+        # if they weren't caught inside it, or if _resolve_and_download itself had an issue
+        # not related to the track processing logic (less likely).
+        # With return_exceptions=True, `results` will contain exceptions if a coroutine failed.
+        for i, result_or_exc in enumerate(results):
+            if isinstance(result_or_exc, Exception):
+                track_id_for_log = "unknown_track_id"
+                try:
+                    # Try to get the ID of the track that failed, if self.tracks is still valid
+                    # and corresponds to the results list.
+                    if i < len(self.tracks) and hasattr(self.tracks[i], 'id'):
+                        track_id_for_log = self.tracks[i].id
+                except Exception: # Fallback if accessing self.tracks[i].id fails
+                    pass
+                logger.error(f"Unhandled exception processing track {track_id_for_log} in album: {result_or_exc}", exc_info=True)
+
 
     async def postprocess(self):
         progress.remove_title(self.meta.album)
